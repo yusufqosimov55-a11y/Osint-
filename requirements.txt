@@ -1,0 +1,4 @@
+aiogram
+aiohttp
+SQLAlchemy
+aiosqlite
