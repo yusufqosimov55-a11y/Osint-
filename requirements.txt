@@ -1,4 +1,4 @@
 aiogram>=3.13,<4.0
-aiohttp
 phonenumbers>=8.13,<10.0
-maigret
+aiohttp>=3.9,<4.0
+Pillow>=10.0,<13.0
