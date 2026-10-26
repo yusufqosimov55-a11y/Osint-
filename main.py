@@ -114,4 +114,4 @@ async def search_by_username(username: str) -> dict:
                         found.append({"source": name, "url": url, "description": f"Профиль найден ({name})", "confidence": "Вероятное"})
             except Exception:
                 continue
-    return {"status": "найдено" if found else "
+return {"status": "найдено" if found else "не найдено", "results": found}
