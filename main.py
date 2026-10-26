@@ -1,17 +1,18 @@
-# OSINT SHERLOK — единый main.py (Python 3.11+)
+ OSINT SHERLOK — единый main.py (Python 3.11+)
 # requirements.txt:
 # aiogram>=3.13,<4.0
 # phonenumbers>=8.13,<10.0
 # aiohttp>=3.9,<4.0
 # Pillow>=10.0,<13.0
+# maigret>=0.5,<1.0
+# beautifulsoup4>=4.12,<5.0
 #
 # Render: Build: pip install -r requirements.txt | Start: python main.py
 # Environment: BOT_TOKEN=<токен от BotFather>
 #
 # Реально реализовано: телефон (локальные справочные данные), формат email,
-# IP и DNS домена, EXIF фото, ссылки на веб-поиск публичных Telegram-страниц.
-# Maigret/Sherlock запускаются, только если установлены на сервере и включены
-# через ENABLE_MAIGRET=true / ENABLE_SHERLOCK=true.
+# поиск публичных профилей через Maigret, веб-поиск, IP/DNS, EXIF и ссылки Telegram.
+# Maigret устанавливается из requirements.txt; поиск зависит от доступности сайтов.
 # PhoneInfoga, Holehe, SpiderFoot не подключены автоматически: им нужны отдельные
 # установки/настройки. Бот не выдумывает результаты и не ищет закрытые данные.
 
@@ -24,6 +25,7 @@ import re
 import shutil
 import socket
 import time
+from bs4 import BeautifulSoup
 from urllib.parse import quote, urlparse
 
 import phonenumbers
@@ -38,8 +40,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
-ENABLE_MAIGRET = os.getenv("ENABLE_MAIGRET", "false").lower() == "true"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "75"))
+ENABLE_MAIGRET = os.getenv("ENABLE_MAIGRET", "true").lower() == "true"
 ENABLE_SHERLOCK = os.getenv("ENABLE_SHERLOCK", "false").lower() == "true"
 MAIGRET_COMMAND = os.getenv("MAIGRET_COMMAND", "maigret")
 SHERLOCK_COMMAND = os.getenv("SHERLOCK_COMMAND", "sherlock")
@@ -61,6 +63,7 @@ def main_menu():
          InlineKeyboardButton(text="📢 Telegram-группы/каналы", callback_data="tgsearch")],
         [InlineKeyboardButton(text="🌐 IP / домен", callback_data="domain"),
          InlineKeyboardButton(text="🖼 EXIF фото", callback_data="exif")],
+        [InlineKeyboardButton(text="🔎 Поиск по открытому интернету", callback_data="websearch")],
         [InlineKeyboardButton(text="🔍 Комплексная проверка", callback_data="full")],
         [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")],
     ])
@@ -86,6 +89,7 @@ def tg_links(query):
 
 
 class Flow(StatesGroup):
+    websearch = State()
     phone = State()
     email = State()
     username = State()
@@ -175,16 +179,15 @@ async def domain_check(value):
 async def username_check(username):
     tools = []
     if ENABLE_MAIGRET:
-        tools.append(("Maigret", MAIGRET_COMMAND, [username, "--no-progressbar"]))
+        tools.append(("Maigret", MAIGRET_COMMAND, [username, "--no-progressbar", "--timeout", "10", "-n", "25"]))
     if ENABLE_SHERLOCK:
         tools.append(("Sherlock", SHERLOCK_COMMAND, [username, "--print-found"]))
     if not tools:
         return (
             f"Никнейм: <code>{esc(username)}</code>\n\n"
-            "Поиск по внешним сайтам пока выключен. Для его запуска нужно установить "
-            "Maigret/Sherlock на сервере и включить переменную ENABLE_MAIGRET=true "
-            "или ENABLE_SHERLOCK=true.\n"
-            "Совпадение никнейма не подтверждает личность."
+            "Инструмент поиска профилей не найден на сервере. Проверь Build Logs на Render: "
+            "пакет Maigret должен установиться из requirements.txt. Можно также включить "
+            "Sherlock отдельной настройкой.\nСовпадение никнейма не подтверждает личность."
         )
     reports = []
     for name, command, args in tools:
@@ -212,6 +215,84 @@ async def username_check(username):
         f"👤 Никнейм: <code>{esc(username)}</code>\n\n" + "\n\n".join(reports)
         + "\n\n⚠️ Совпадения никнейма не доказывают, что аккаунты принадлежат одному человеку."
     )
+
+
+# Поиск только по общедоступным веб-страницам. Поисковый запрос передаётся DuckDuckGo.
+SENSITIVE_SEARCH_TERMS = (
+    "паспорт", "паспортные данные", "домашний адрес", "адрес проживания",
+    "прописка", "владелец номера", "на кого зарегистрирован номер",
+    "слив базы", "база утечек", "утечка данных", "личные данные паспорта",
+)
+
+
+def web_search_links(query):
+    q = quote(query)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Google", url=f"https://www.google.com/search?q={q}"),
+         InlineKeyboardButton(text="Bing", url=f"https://www.bing.com/search?q={q}")],
+        [InlineKeyboardButton(text="DuckDuckGo", url=f"https://duckduckgo.com/?q={q}")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")],
+    ])
+
+
+async def public_web_search(query):
+    query = " ".join(query.split()).strip()
+    if not query or len(query) > 180:
+        return "❌ Запрос должен быть от 1 до 180 символов.", web_search_links("OSINT")
+    lowered = query.casefold()
+    if any(term in lowered for term in SENSITIVE_SEARCH_TERMS):
+        return (
+            "⛔ Не выполняю запросы на поиск паспортных данных, скрытого владельца номера, "
+            "домашнего адреса или данных из утечек. Могу искать публичные страницы, "
+            "публикации, организации и другие несекретные сведения.",
+            web_search_links(""),
+        )
+    url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; OSINT-SHERLOK/1.0; +https://duckduckgo.com/)"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"HTTP {response.status}")
+                body = await response.text(errors="replace")
+        soup = BeautifulSoup(body, "html.parser")
+        results = []
+        for node in soup.select(".result"):
+            title_node = node.select_one(".result__title a")
+            snippet_node = node.select_one(".result__snippet")
+            if not title_node:
+                continue
+            title = title_node.get_text(" ", strip=True)
+            href = title_node.get("href", "")
+            snippet = snippet_node.get_text(" ", strip=True) if snippet_node else ""
+            if href.startswith("//"):
+                href = "https:" + href
+            if not href.startswith("http"):
+                continue
+            results.append((title[:180], href, snippet[:300]))
+            if len(results) >= 6:
+                break
+        if not results:
+            text = (
+                f"🔎 <b>Открытый веб-поиск</b>\nЗапрос: <code>{esc(query)}</code>\n\n"
+                "Поисковая выдача не вернула читаемые результаты (сайт может ограничивать запросы). "
+                "Открой поиск в браузере кнопками ниже."
+            )
+        else:
+            lines = [f"🔎 <b>Открытый веб-поиск</b>\nЗапрос: <code>{esc(query)}</code>\n"]
+            for i, (title, href, snippet) in enumerate(results, 1):
+                lines.append(f"{i}. <a href=\"{html.escape(href, quote=True)}\">{esc(title)}</a>\n{esc(snippet) if snippet else 'Описание недоступно.'}")
+            lines.append("\n⚠️ Это результаты поисковой системы, не подтверждение достоверности. Проверь источник и дату публикации.")
+            text = "\n\n".join(lines)
+        return text, web_search_links(query)
+    except Exception:
+        text = (
+            f"🔎 <b>Открытый веб-поиск</b>\nЗапрос: <code>{esc(query)}</code>\n\n"
+            "Не удалось получить выдачу автоматически: поисковик мог ограничить запрос или соединение истекло. "
+            "Попробуй открыть результаты через кнопки ниже."
+        )
+        return text, web_search_links(query)
 
 
 async def exif_check(message):
@@ -267,8 +348,9 @@ async def start(message: Message, state: FSMContext):
 @router.message(Command("help"))
 async def help_cmd(message: Message):
     await message.answer(
-        "Телефон — справочная проверка; email — формат; никнейм — Maigret/Sherlock, если настроены; "
-        "Telegram — ссылки на публичный веб-поиск; IP/домен — DNS; EXIF — метаданные фото.\n"
+        "Телефон — справочная проверка; email — формат; никнейм — поиск Maigret/Sherlock; "
+        "открытый веб-поиск — поиск публичных страниц; Telegram — ссылки на публичный веб-поиск; "
+        "IP/домен — DNS; EXIF — метаданные фото.\n"
         "Закрытые данные, пароли и личные сообщения не извлекаются.",
         reply_markup=main_menu(),
     )
@@ -300,6 +382,7 @@ async def cancel(call: CallbackQuery, state: FSMContext):
 
 
 PROMPTS = {
+    "websearch": ("🔎 Отправь поисковый запрос для поиска в открытом интернете. Не вводи пароли, паспортные данные или чужие закрытые сведения.", Flow.websearch),
     "phone": ("📞 Отправь номер в международном формате, например +998901234567.", Flow.phone),
     "email": ("✉️ Отправь email для проверки формата.", Flow.email),
     "username": ("👤 Отправь никнейм без пробелов.", Flow.username),
@@ -316,6 +399,16 @@ async def choose(call: CallbackQuery, state: FSMContext):
     await state.set_state(new_state)
     await call.answer()
     await call.message.edit_text(prompt, reply_markup=nav())
+
+
+@router.message(Flow.websearch)
+async def websearch_input(message: Message, state: FSMContext):
+    query = (message.text or "").strip()
+    status = await message.answer("⏳ Ищу открытые веб-страницы…")
+    result, keyboard = await public_web_search(query)
+    # Telegram message text limit is 4096 characters; keep room for markup.
+    await status.edit_text(result[:3900], reply_markup=keyboard, disable_web_page_preview=True)
+    await state.clear()
 
 
 @router.message(Flow.phone)
