@@ -1,4 +1,4 @@
- OSINT SHERLOK — единый main.py (Python 3.11+)
+ 
 # requirements.txt:
 # aiogram>=3.13,<4.0
 # phonenumbers>=8.13,<10.0
